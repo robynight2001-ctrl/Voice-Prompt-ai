@@ -1,0 +1,6 @@
+{
+  "name": "VoicePrompt AI",
+  "description": "Your Prompt, Your Voice. AI Voice Generation Studio for converting Arabic and English prompts into expressive, realistic human speech.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
