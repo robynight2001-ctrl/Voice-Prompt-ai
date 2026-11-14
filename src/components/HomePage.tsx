@@ -3,6 +3,8 @@ import { ArrowLeft, ArrowRight, Check, Headphones, Lock, Mic2, Sliders, Volume2 
 import type { Lang } from '../i18n/translations';
 import { TEXT } from '../i18n/translations';
 import type { SiteSettings, SubscriptionPlan } from '../shared/voices';
+import heroStudioImg from '../assets/images/hero_voice_studio_1794612423612.jpg';
+import panelAcousticImg from '../assets/images/studio_acoustic_surface_1794612425483.jpg';
 
 export type AppPage = 'home' | 'voices' | 'studio' | 'projects' | 'subscriptions' | 'admin';
 
@@ -13,8 +15,8 @@ interface HomePageProps {
   onNavigate: (page: AppPage, planId?: string) => void;
 }
 
-const HERO_IMAGE = '/src/assets/images/hero_voice_studio_1794612423612.jpg';
-const PANEL_IMAGE = '/src/assets/images/studio_acoustic_surface_1794612425483.jpg';
+const HERO_IMAGE = heroStudioImg;
+const PANEL_IMAGE = panelAcousticImg;
 
 export function HomePage({ lang, settings, plans, onNavigate }: HomePageProps) {
   const t = TEXT[lang];

@@ -2,7 +2,6 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import express, { type Request, type Response } from 'express';
-import { createServer as createViteServer } from 'vite';
 import {
   DEFAULT_VOICE_SETTINGS,
   VOICE_CHARACTERS,
@@ -544,6 +543,10 @@ app.put('/api/admin/settings', requireAdmin, (req: AuthedRequest, res: Response)
   res.json({ settings: getSiteSettings(), plans: getAllPlans() });
 });
 
+app.use('/api', (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
 // ---------------------------------------------------------------------------
 // Vite Dev Middleware or Static Production Server on Port 3000
 // ---------------------------------------------------------------------------
@@ -553,6 +556,7 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

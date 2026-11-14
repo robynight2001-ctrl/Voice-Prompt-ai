@@ -1,14 +1,28 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { SiteSettings, SubscriptionPlan, SubscriptionStatus, UserProfile } from '../src/shared/voices.ts';
 
-const dataDir = path.join(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+function resolveWritableDataDir(): string {
+  const preferred = path.join(process.cwd(), 'data');
+  try {
+    if (!fs.existsSync(preferred)) {
+      fs.mkdirSync(preferred, { recursive: true });
+    }
+    fs.accessSync(preferred, fs.constants.W_OK);
+    return preferred;
+  } catch {
+    const fallback = path.join(os.tmpdir(), 'voiceprompt-ai-data');
+    if (!fs.existsSync(fallback)) {
+      fs.mkdirSync(fallback, { recursive: true });
+    }
+    return fallback;
+  }
 }
 
+const dataDir = resolveWritableDataDir();
 const dbPath = path.join(dataDir, 'voiceprompt.db');
 export const db = new Database(dbPath);
 

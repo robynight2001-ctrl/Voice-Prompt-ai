@@ -37,8 +37,16 @@ async function request<T>(url: string, options: RequestInit = {}, token?: string
     headers.Authorization = `Bearer ${token}`;
   }
   const res = await fetch(url, { ...options, headers });
-  const data = await res.json().catch(() => ({}));
+  const contentType = res.headers.get('content-type') || '';
+  const data = contentType.includes('application/json')
+    ? await res.json().catch(() => ({}))
+    : {};
   if (!res.ok) {
+    if (res.status === 404 && !data.error) {
+      throw new Error(
+        'API server route not found (404). Make sure the full-stack server (node server.ts) is running and not static-only hosting.'
+      );
+    }
     throw new Error(data.error || `Request failed (${res.status})`);
   }
   return data as T;
