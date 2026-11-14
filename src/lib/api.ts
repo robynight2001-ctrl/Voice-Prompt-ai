@@ -86,9 +86,9 @@ export const api = {
 
   getVoices: () => request<{ voices: VoiceCharacter[] }>('/api/voices'),
 
-  getVoiceSample: (voiceId: string, lang: 'ar' | 'en') =>
+  getVoiceSample: (voiceId: string, lang: 'ar' | 'ar-EG' | 'en') =>
     request<{ audioBase64: string; mimeType: string; durationSeconds: number }>(
-      `/api/voices/${encodeURIComponent(voiceId)}/sample?lang=${lang}`
+      `/api/voices/${encodeURIComponent(voiceId)}/sample?lang=${encodeURIComponent(lang)}`
     ),
 
   register: (payload: {

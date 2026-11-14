@@ -382,20 +382,28 @@ function ensureWavBuffer(rawBuffer: Buffer, mimeType?: string): Buffer {
   return Buffer.concat([header, rawBuffer]);
 }
 
-export async function generateExpressiveSpeech(params: {
-  spokenText: string;
-  characterId: string;
-  settings: VoiceSettings;
-}): Promise<GeneratedSpeechResult> {
-  const ai = getClient();
-  const character =
-    VOICE_CHARACTERS.find((v) => v.id === params.characterId) || VOICE_CHARACTERS[0];
+function formatGeminiError(err: unknown): Error {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('"code":429')) {
+    return new Error(
+      'تم استهلاك الحد اليومي المجاني لموديل الصوت حاليًا (429). يرجى المحاولة لاحقًا أو ترقية مفتاح Gemini API في الإعدادات.'
+    );
+  }
+  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED')) {
+    return new Error('مفتاح Gemini API غير صالح أو يفتقر للصلاحيات في إعدادات الخادم.');
+  }
+  return err instanceof Error ? err : new Error(raw);
+}
 
-  const styleDirection = buildSpeechStyleDirection(character, params.settings);
-  const preparedText = enrichSpokenTextWithVocalCues(params.spokenText, params.settings);
-
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash-tts',
+async function callTtsModel(
+  ai: GoogleGenAI,
+  model: 'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts',
+  preparedText: string,
+  styleDirection: string,
+  voiceName: string
+) {
+  return ai.models.generateContent({
+    model,
     contents: [
       {
         role: 'user',
@@ -414,12 +422,61 @@ export async function generateExpressiveSpeech(params: {
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
-            voiceName: character.prebuiltVoice,
+            voiceName,
           },
         },
       },
     },
   });
+}
+
+export async function generateExpressiveSpeech(params: {
+  spokenText: string;
+  characterId: string;
+  settings: VoiceSettings;
+  preferLite?: boolean;
+}): Promise<GeneratedSpeechResult> {
+  const ai = getClient();
+  const character =
+    VOICE_CHARACTERS.find((v) => v.id === params.characterId) || VOICE_CHARACTERS[0];
+
+  const styleDirection = buildSpeechStyleDirection(character, params.settings);
+  const preparedText = params.preferLite
+    ? params.spokenText.trim()
+    : enrichSpokenTextWithVocalCues(params.spokenText, params.settings);
+
+  const primaryModel = params.preferLite
+    ? 'gemini-3.8-flash-lite-tts'
+    : 'gemini-3.8-flash-tts';
+
+  let response;
+  try {
+    response = await callTtsModel(
+      ai,
+      primaryModel,
+      preparedText,
+      styleDirection,
+      character.prebuiltVoice
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const isQuota = msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429');
+    if (isQuota && primaryModel === 'gemini-3.8-flash-tts') {
+      try {
+        response = await callTtsModel(
+          ai,
+          'gemini-3.8-flash-lite-tts',
+          params.spokenText.trim(),
+          styleDirection,
+          character.prebuiltVoice
+        );
+      } catch (fallbackErr) {
+        throw formatGeminiError(fallbackErr);
+      }
+    } else {
+      throw formatGeminiError(err);
+    }
+  }
 
   const parts = response.candidates?.[0]?.content?.parts ?? [];
   const audioPart = parts.find((p) => p.inlineData?.data);

@@ -56,17 +56,38 @@ app.get('/api/voices', (_req: Request, res: Response) => {
   res.json({ voices: VOICE_CHARACTERS });
 });
 
+const EGYPTIAN_SAMPLE_TEXTS: Record<string, string> = {
+  young_girl: 'أهلاً بيك! ده صوتي الطبيعي، وأقدر أتكلم بفرح أو خوف أو دهشة بشكل واقعي جدًا.',
+  young_boy: 'يا نهار أبيض! شفت اللي حصل دلوقتي؟ المغامرة دي هتكون جامدة جدًا!',
+  young_man: 'أهلاً بيك في استوديو الأصوات، هنا بنحول أي جملة تكتبها لصوت حي وواضح.',
+  elderly_man: 'اسمع يا ابني، الأيام علمتني إن الصبر هو مفتاح كل باب مقفول في الدنيا.',
+  young_woman: 'كل فكرة حلوة بتبدأ بكلمة مكتوبة، ومع الأداء الصح بتوصل لقلب اللي بيسمعها.',
+  elderly_woman: 'تعالى اقعد جنبي يا حبيبي، خليني أحكيلك حكاية حلوة من أيام زمان.',
+  little_girl: 'ماما! انتي سامعة الصوت ده؟ أنا خايفة أوي ومش عايزة أقعد لوحدي هنا.',
+  little_boy: 'بص فوق في السما! الطيارة الورق بتاعتي طارت عالية أوي فوق الشجر!',
+  news_anchor: 'أهلاً بكم في نشرة الأخبار، مع أهم المستجدات التقنية وتطورات الذكاء الاصطناعي النهاردة.',
+  storyteller: 'في ليلة هادية وضلمة، والهوا ساكت تمامًا، باب القصر القديم اتفتح بالراحة جدًا.',
+  cartoon: 'آها! أخيرًا لقيت الكنز المستخبي، بس استنى... هو الصندوق ده بيتحرك لوحده ليه؟!',
+  horror: 'ما تبصش وراك دلوقتي... الصوت اللي انت سامعه ده جاي من جوه الأوضة نفسها.',
+  calm_soft: 'خد نفس عميق دلوقتي، وسيب كل التعب والتوتر يروح مع الهدوء.',
+  energetic: 'جاهزين للانطلاق؟ دي فرصتك تعمل محتوى صوتي رهيب يبهر كل الناس!',
+  comedic: 'بصراحة كنت فاكر القهوة هتفوقني، لحد ما نسيت أصلاً أنا حطيت الكوباية فين!',
+};
+
 app.get('/api/voices/:id/sample', async (req: Request, res: Response) => {
   try {
     const voiceId = String(req.params.id || '');
-    const lang = req.query.lang === 'en' ? 'en' : 'ar';
+    const rawLang = String(req.query.lang || 'ar');
+    const langKey: 'ar' | 'ar-EG' | 'en' =
+      rawLang === 'en' ? 'en' : rawLang === 'ar-EG' ? 'ar-EG' : 'ar';
+
     const voice = VOICE_CHARACTERS.find((v) => v.id === voiceId);
     if (!voice) {
       res.status(404).json({ error: 'Voice character not found.' });
       return;
     }
 
-    const cacheKey = `${voice.id}_${lang}`;
+    const cacheKey = `${voice.id}_${langKey}`;
     const cached = db
       .prepare('SELECT audio_base64, duration_seconds FROM voice_samples_cache WHERE cache_key = ?')
       .get(cacheKey) as { audio_base64: string; duration_seconds: number } | undefined;
@@ -83,8 +104,9 @@ app.get('/api/voices/:id/sample', async (req: Request, res: Response) => {
 
     const sampleSettings: VoiceSettings = {
       ...DEFAULT_VOICE_SETTINGS,
-      language: lang,
-      dialect: lang === 'en' ? 'english_us' : 'msa',
+      language: langKey === 'en' ? 'en' : 'ar',
+      dialect:
+        langKey === 'en' ? 'english_us' : langKey === 'ar-EG' ? 'egyptian' : 'msa',
       voiceGender: voice.gender,
       pitch: voice.defaultPitch,
       deliveryMode: voice.defaultDelivery,
@@ -101,10 +123,18 @@ app.get('/api/voices/:id/sample', async (req: Request, res: Response) => {
       emotionIntensity: 70,
     };
 
+    const spokenText =
+      langKey === 'en'
+        ? voice.sampleTextEn
+        : langKey === 'ar-EG'
+        ? EGYPTIAN_SAMPLE_TEXTS[voice.id] || voice.sampleTextAr
+        : voice.sampleTextAr;
+
     const result = await generateExpressiveSpeech({
-      spokenText: lang === 'en' ? voice.sampleTextEn : voice.sampleTextAr,
+      spokenText,
       characterId: voice.id,
       settings: sampleSettings,
+      preferLite: true,
     });
 
     db.prepare(
