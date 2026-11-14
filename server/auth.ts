@@ -1,6 +1,12 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { db, getAuthSecret, refreshUserExpiration, type DbUserRow } from './db.ts';
+import {
+  getAdminById,
+  getAuthSecret,
+  getUserById,
+  refreshUserExpiration,
+  type DbUserRow,
+} from './db.ts';
 
 export interface TokenPayload {
   sub: string;
@@ -15,28 +21,24 @@ export interface AuthedRequest extends Request {
 
 const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
 
-export function signToken(sub: string, role: 'user' | 'admin'): string {
+export async function signToken(sub: string, role: 'user' | 'admin'): Promise<string> {
+  const secret = await getAuthSecret();
   const payload: TokenPayload = {
     sub,
     role,
     exp: Date.now() + TOKEN_TTL_MS,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const sig = crypto
-    .createHmac('sha256', getAuthSecret())
-    .update(encoded)
-    .digest('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(encoded).digest('base64url');
   return `${encoded}.${sig}`;
 }
 
-export function verifyToken(token: string): TokenPayload | null {
+export async function verifyToken(token: string): Promise<TokenPayload | null> {
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [encoded, sig] = parts;
-  const expectedSig = crypto
-    .createHmac('sha256', getAuthSecret())
-    .update(encoded)
-    .digest('base64url');
+  const secret = await getAuthSecret();
+  const expectedSig = crypto.createHmac('sha256', secret).update(encoded).digest('base64url');
 
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expectedSig);
@@ -60,27 +62,39 @@ function extractBearer(req: Request): string | null {
   return header.slice(7).trim();
 }
 
-export function requireUser(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const token = extractBearer(req);
-  if (!token) {
-    res.status(401).json({ error: 'Authentication required', code: 'UNAUTHORIZED' });
-    return;
+export async function requireUser(
+  req: AuthedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const token = extractBearer(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication required', code: 'UNAUTHORIZED' });
+      return;
+    }
+    const payload = await verifyToken(token);
+    if (!payload || payload.role !== 'user') {
+      res.status(401).json({ error: 'Invalid or expired user session', code: 'UNAUTHORIZED' });
+      return;
+    }
+    const row = await getUserById(payload.sub);
+    if (!row) {
+      res.status(401).json({ error: 'Account not found', code: 'UNAUTHORIZED' });
+      return;
+    }
+    req.user = await refreshUserExpiration(row);
+    next();
+  } catch (err) {
+    next(err);
   }
-  const payload = verifyToken(token);
-  if (!payload || payload.role !== 'user') {
-    res.status(401).json({ error: 'Invalid or expired user session', code: 'UNAUTHORIZED' });
-    return;
-  }
-  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub) as DbUserRow | undefined;
-  if (!row) {
-    res.status(401).json({ error: 'Account not found', code: 'UNAUTHORIZED' });
-    return;
-  }
-  req.user = refreshUserExpiration(row);
-  next();
 }
 
-export function requireActiveSubscription(req: AuthedRequest, res: Response, next: NextFunction): void {
+export function requireActiveSubscription(
+  req: AuthedRequest,
+  res: Response,
+  next: NextFunction
+): void {
   const user = req.user;
   if (!user) {
     res.status(401).json({ error: 'Authentication required', code: 'UNAUTHORIZED' });
@@ -112,24 +126,30 @@ export function requireActiveSubscription(req: AuthedRequest, res: Response, nex
   next();
 }
 
-export function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const token = extractBearer(req);
-  if (!token) {
-    res.status(401).json({ error: 'Admin authentication required', code: 'ADMIN_UNAUTHORIZED' });
-    return;
+export async function requireAdmin(
+  req: AuthedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const token = extractBearer(req);
+    if (!token) {
+      res.status(401).json({ error: 'Admin authentication required', code: 'ADMIN_UNAUTHORIZED' });
+      return;
+    }
+    const payload = await verifyToken(token);
+    if (!payload || payload.role !== 'admin') {
+      res.status(403).json({ error: 'Admin privileges required', code: 'FORBIDDEN' });
+      return;
+    }
+    const admin = await getAdminById(payload.sub);
+    if (!admin) {
+      res.status(403).json({ error: 'Admin account not found', code: 'FORBIDDEN' });
+      return;
+    }
+    req.adminUsername = admin.username;
+    next();
+  } catch (err) {
+    next(err);
   }
-  const payload = verifyToken(token);
-  if (!payload || payload.role !== 'admin') {
-    res.status(403).json({ error: 'Admin privileges required', code: 'FORBIDDEN' });
-    return;
-  }
-  const admin = db.prepare('SELECT username FROM admins WHERE id = ?').get(payload.sub) as
-    | { username: string }
-    | undefined;
-  if (!admin) {
-    res.status(403).json({ error: 'Admin account not found', code: 'FORBIDDEN' });
-    return;
-  }
-  req.adminUsername = admin.username;
-  next();
 }

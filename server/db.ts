@@ -1,9 +1,54 @@
-import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { SiteSettings, SubscriptionPlan, SubscriptionStatus, UserProfile } from '../src/shared/voices.ts';
+import { Pool, type PoolConfig } from 'pg';
+import type {
+  SiteSettings,
+  SubscriptionPlan,
+  SubscriptionStatus,
+  UserProfile,
+} from '../src/shared/voices.ts';
+
+type SqliteDatabase = {
+  pragma(source: string): unknown;
+  exec(source: string): unknown;
+  prepare(source: string): {
+    get(...params: unknown[]): unknown;
+    all(...params: unknown[]): unknown[];
+    run(...params: unknown[]): { changes: number };
+  };
+};
+
+let pgPool: Pool | null = null;
+let sqliteDb: SqliteDatabase | null = null;
+let initPromise: Promise<void> | null = null;
+let cachedAuthSecret: string | null = null;
+
+export function getPostgresConnectionString(): string | null {
+  const candidates = [
+    process.env.DATABASE_URL,
+    process.env.POSTGRES_URL,
+    process.env.POSTGRES_PRISMA_URL,
+    process.env.SUPABASE_DB_URL,
+  ];
+  for (const val of candidates) {
+    if (val && val.trim().length > 0 && !val.includes('MY_DATABASE_URL')) {
+      return val.trim();
+    }
+  }
+  return null;
+}
+
+export function isVercelRuntime(): boolean {
+  return Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+}
+
+export function getDatabaseKind(): 'postgres' | 'sqlite' | 'unconfigured' {
+  if (getPostgresConnectionString()) return 'postgres';
+  if (isVercelRuntime()) return 'unconfigured';
+  return 'sqlite';
+}
 
 function resolveWritableDataDir(): string {
   const preferred = path.join(process.cwd(), 'data');
@@ -22,12 +67,43 @@ function resolveWritableDataDir(): string {
   }
 }
 
-const dataDir = resolveWritableDataDir();
-const dbPath = path.join(dataDir, 'voiceprompt.db');
-export const db = new Database(dbPath);
+function toSqlitePlaceholders(sql: string): string {
+  return sql.replace(/\$\d+/g, '?');
+}
 
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+async function queryAll<T = Record<string, unknown>>(
+  sql: string,
+  params: unknown[] = []
+): Promise<T[]> {
+  if (pgPool) {
+    const res = await pgPool.query(sql, params);
+    return res.rows as T[];
+  }
+  if (sqliteDb) {
+    return sqliteDb.prepare(toSqlitePlaceholders(sql)).all(...params) as T[];
+  }
+  throw new Error('Database has not been initialized.');
+}
+
+async function queryOne<T = Record<string, unknown>>(
+  sql: string,
+  params: unknown[] = []
+): Promise<T | null> {
+  const rows = await queryAll<T>(sql, params);
+  return rows[0] ?? null;
+}
+
+async function execute(sql: string, params: unknown[] = []): Promise<{ rowCount: number }> {
+  if (pgPool) {
+    const res = await pgPool.query(sql, params);
+    return { rowCount: res.rowCount ?? 0 };
+  }
+  if (sqliteDb) {
+    const info = sqliteDb.prepare(toSqlitePlaceholders(sql)).run(...params);
+    return { rowCount: info.changes };
+  }
+  throw new Error('Database has not been initialized.');
+}
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -45,9 +121,9 @@ export function verifyPassword(password: string, stored: string): boolean {
   return crypto.timingSafeEqual(derived, storedBuf);
 }
 
-export function initDatabase(): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
+async function runSchemaAndSeed(): Promise<void> {
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       phone TEXT UNIQUE NOT NULL,
@@ -61,22 +137,20 @@ export function initDatabase(): void {
       daily_date TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS admins (
+    )`,
+    `CREATE TABLE IF NOT EXISTS admins (
       id TEXT PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS plans (
+    )`,
+    `CREATE TABLE IF NOT EXISTS plans (
       id TEXT PRIMARY KEY,
       name_ar TEXT NOT NULL,
       name_en TEXT NOT NULL,
       description_ar TEXT NOT NULL,
       description_en TEXT NOT NULL,
-      price REAL NOT NULL,
+      price DOUBLE PRECISION NOT NULL,
       currency TEXT NOT NULL DEFAULT 'EGP',
       duration_days INTEGER NOT NULL,
       features_ar TEXT NOT NULL,
@@ -84,46 +158,48 @@ export function initDatabase(): void {
       is_popular INTEGER NOT NULL DEFAULT 0,
       is_active INTEGER NOT NULL DEFAULT 1,
       sort_order INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS site_settings (
+    )`,
+    `CREATE TABLE IF NOT EXISTS site_settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS stats (
+    )`,
+    `CREATE TABLE IF NOT EXISTS stats (
       key TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS voice_samples_cache (
+    )`,
+    `CREATE TABLE IF NOT EXISTS voice_samples_cache (
       cache_key TEXT PRIMARY KEY,
       audio_base64 TEXT NOT NULL,
-      duration_seconds REAL NOT NULL,
+      duration_seconds DOUBLE PRECISION NOT NULL,
       created_at TEXT NOT NULL
-    );
-  `);
+    )`,
+  ];
 
-  // Seed initial admin if missing (credentials strictly stored hashed in SQLite on server)
-  const existingAdmin = db.prepare('SELECT id FROM admins LIMIT 1').get();
+  for (const ddl of statements) {
+    if (pgPool) {
+      await pgPool.query(ddl);
+    } else if (sqliteDb) {
+      sqliteDb.exec(ddl);
+    }
+  }
+
+  // Seed initial admin if missing (credentials strictly hashed on server)
+  const existingAdmin = await queryOne<{ id: string }>('SELECT id FROM admins LIMIT 1');
   if (!existingAdmin) {
     const adminPasswordHash = hashPassword('Ro15112001');
-    db.prepare(
-      'INSERT INTO admins (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)'
-    ).run(crypto.randomUUID(), 'Ramadan', adminPasswordHash, new Date().toISOString());
+    await execute(
+      'INSERT INTO admins (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)',
+      [crypto.randomUUID(), 'Ramadan', adminPasswordHash, new Date().toISOString()]
+    );
   }
 
   // Seed 4 subscription plans if empty
-  const existingPlanCount = db.prepare('SELECT COUNT(*) as count FROM plans').get() as { count: number };
-  if (existingPlanCount.count === 0) {
-    const insertPlan = db.prepare(`
-      INSERT INTO plans (
-        id, name_ar, name_en, description_ar, description_en,
-        price, currency, duration_days, features_ar, features_en,
-        is_popular, is_active, sort_order
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+  const planCountRow = await queryOne<{ count: string | number }>(
+    'SELECT COUNT(*) as count FROM plans'
+  );
+  const existingPlanCount = Number(planCountRow?.count ?? 0);
 
+  if (existingPlanCount === 0) {
     const defaultPlans = [
       {
         id: '1_month',
@@ -133,8 +209,18 @@ export function initDatabase(): void {
         descEn: 'Ideal for short-term creators and quick studio voice productions.',
         price: 199,
         durationDays: 30,
-        featuresAr: ['جميع الأصوات الـ 15 المتقدمة', 'تحليل الـ Prompt بالذكاء الاصطناعي', 'تصدير بجودة WAV ستوديو', 'حفظ محلي لا محدود للمشاريع'],
-        featuresEn: ['All 15 expressive AI voices', 'Smart AI Prompt Analyzer', 'Studio WAV audio export', 'Unlimited local device projects'],
+        featuresAr: [
+          'جميع الأصوات الـ 15 المتقدمة',
+          'تحليل الـ Prompt بالذكاء الاصطناعي',
+          'تصدير بجودة WAV ستوديو',
+          'حفظ محلي لا محدود للمشاريع',
+        ],
+        featuresEn: [
+          'All 15 expressive AI voices',
+          'Smart AI Prompt Analyzer',
+          'Studio WAV audio export',
+          'Unlimited local device projects',
+        ],
         isPopular: 0,
         sortOrder: 1,
       },
@@ -146,8 +232,18 @@ export function initDatabase(): void {
         descEn: 'Balanced choice for content creators, podcasters, and channels.',
         price: 499,
         durationDays: 90,
-        featuresAr: ['توفير 16% عن الباقة الشهرية', 'تحكم كامل بالمشاعر واللهجات', 'أولوية في معالجة التوليد الصوتي', 'نسخ احتياطي وتصدير للمشاريع'],
-        featuresEn: ['Save 16% vs monthly plan', 'Full emotion & dialect controls', 'Priority speech generation', 'Project backup & import/export'],
+        featuresAr: [
+          'توفير 16% عن الباقة الشهرية',
+          'تحكم كامل بالمشاعر واللهجات',
+          'أولوية في معالجة التوليد الصوتي',
+          'نسخ احتياطي وتصدير للمشاريع',
+        ],
+        featuresEn: [
+          'Save 16% vs monthly plan',
+          'Full emotion & dialect controls',
+          'Priority speech generation',
+          'Project backup & import/export',
+        ],
         isPopular: 1,
         sortOrder: 2,
       },
@@ -159,8 +255,18 @@ export function initDatabase(): void {
         descEn: 'Built for production studios, agencies, and long-term series.',
         price: 899,
         durationDays: 180,
-        featuresAr: ['توفير 25% عن الباقة الشهرية', 'توليد صوتي غير محدود بالمدة', 'دعم العربية الفصحى والمصرية والإنجليزية', 'حفظ خاص وآمن على جهازك فقط'],
-        featuresEn: ['Save 25% vs monthly plan', 'Extended multi-scene voice generation', 'MSA, Egyptian Arabic & English support', '100% private local project storage'],
+        featuresAr: [
+          'توفير 25% عن الباقة الشهرية',
+          'توليد صوتي غير محدود بالمدة',
+          'دعم العربية الفصحى والمصرية والإنجليزية',
+          'حفظ خاص وآمن على جهازك فقط',
+        ],
+        featuresEn: [
+          'Save 25% vs monthly plan',
+          'Extended multi-scene voice generation',
+          'MSA, Egyptian Arabic & English support',
+          '100% private local project storage',
+        ],
         isPopular: 0,
         sortOrder: 3,
       },
@@ -172,33 +278,51 @@ export function initDatabase(): void {
         descEn: 'Best annual value for continuous high-volume vocal production.',
         price: 1499,
         durationDays: 365,
-        featuresAr: ['أعلى توفير بنسبة 37%', 'وصول كامل لكل تحديثات الأصوات', 'تحكم دقيق بالنبرات والهمس والصراخ', 'اشتراك سنوي مستقر بدون انقطاع'],
-        featuresEn: ['Maximum 37% annual savings', 'All future voice persona updates', 'Fine-grained whisper/shout & pitch tuning', 'Uninterrupted year-round studio access'],
+        featuresAr: [
+          'أعلى توفير بنسبة 37%',
+          'وصول كامل لكل تحديثات الأصوات',
+          'تحكم دقيق بالنبرات والهمس والصراخ',
+          'اشتراك سنوي مستقر بدون انقطاع',
+        ],
+        featuresEn: [
+          'Maximum 37% annual savings',
+          'All future voice persona updates',
+          'Fine-grained whisper/shout & pitch tuning',
+          'Uninterrupted year-round studio access',
+        ],
         isPopular: 0,
         sortOrder: 4,
       },
     ];
 
     for (const p of defaultPlans) {
-      insertPlan.run(
-        p.id,
-        p.nameAr,
-        p.nameEn,
-        p.descAr,
-        p.descEn,
-        p.price,
-        'EGP',
-        p.durationDays,
-        JSON.stringify(p.featuresAr),
-        JSON.stringify(p.featuresEn),
-        p.isPopular,
-        1,
-        p.sortOrder
+      await execute(
+        `INSERT INTO plans (
+          id, name_ar, name_en, description_ar, description_en,
+          price, currency, duration_days, features_ar, features_en,
+          is_popular, is_active, sort_order
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (id) DO NOTHING`,
+        [
+          p.id,
+          p.nameAr,
+          p.nameEn,
+          p.descAr,
+          p.descEn,
+          p.price,
+          'EGP',
+          p.durationDays,
+          JSON.stringify(p.featuresAr),
+          JSON.stringify(p.featuresEn),
+          p.isPopular,
+          1,
+          p.sortOrder,
+        ]
       );
     }
   }
 
-  // Seed default site settings
+  // Seed default site settings (persists auth_secret in DB across serverless invocations)
   const defaultSettings: Record<string, string> = {
     site_name: 'VoicePrompt AI',
     tagline_ar: 'اكتب الوصف... واسمع الصوت.',
@@ -210,24 +334,105 @@ export function initDatabase(): void {
     auth_secret: crypto.randomBytes(32).toString('hex'),
   };
 
-  const insertSetting = db.prepare('INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)');
   for (const [k, v] of Object.entries(defaultSettings)) {
-    insertSetting.run(k, v);
+    await execute(
+      'INSERT INTO site_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+      [k, v]
+    );
   }
 
-  db.prepare('INSERT OR IGNORE INTO stats (key, value) VALUES (?, ?)').run('total_generations', 0);
+  await execute(
+    'INSERT INTO stats (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+    ['total_generations', 0]
+  );
+
+  // Cache auth secret in memory for this runtime instance
+  if (process.env.AUTH_SECRET && process.env.AUTH_SECRET.length >= 16) {
+    cachedAuthSecret = process.env.AUTH_SECRET;
+  } else {
+    const row = await queryOne<{ value: string }>(
+      'SELECT value FROM site_settings WHERE key = $1',
+      ['auth_secret']
+    );
+    cachedAuthSecret = row?.value || 'fallback-dev-secret-change-in-env';
+  }
 }
 
-export function getAuthSecret(): string {
+export async function initDatabase(): Promise<void> {
+  if (initPromise) {
+    return initPromise;
+  }
+
+  initPromise = (async () => {
+    const pgUrl = getPostgresConnectionString();
+
+    if (pgUrl) {
+      const isLocalhost = /localhost|127\.0\.0\.1/i.test(pgUrl);
+      const disableSsl = /sslmode=disable/i.test(pgUrl);
+      const poolConfig: PoolConfig = {
+        connectionString: pgUrl,
+        max: 5,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+        ...(isLocalhost || disableSsl ? {} : { ssl: { rejectUnauthorized: false } }),
+      };
+      pgPool = new Pool(poolConfig);
+      await runSchemaAndSeed();
+      return;
+    }
+
+    if (isVercelRuntime()) {
+      throw new Error(
+        'Database is not configured for Vercel deployment. Please set DATABASE_URL or POSTGRES_URL (Vercel Postgres, Neon, or Supabase) in your Vercel Project Environment Variables and redeploy.'
+      );
+    }
+
+    // Local development / self-hosted Node fallback using SQLite
+    const sqlitePkgName = 'better-sqlite3';
+    const mod = (await import(/* @vite-ignore */ sqlitePkgName)) as {
+      default: new (filename: string) => SqliteDatabase;
+    };
+    const Database = mod.default;
+    const dataDir = resolveWritableDataDir();
+    const dbPath = path.join(dataDir, 'voiceprompt.db');
+    sqliteDb = new Database(dbPath);
+    sqliteDb.pragma('journal_mode = WAL');
+    sqliteDb.pragma('foreign_keys = ON');
+    await runSchemaAndSeed();
+  })().catch((err) => {
+    // Allow retry on transient cold-start connection failure
+    initPromise = null;
+    if (pgPool) {
+      void pgPool.end().catch(() => {});
+      pgPool = null;
+    }
+    throw err;
+  });
+
+  return initPromise;
+}
+
+export async function getAuthSecret(): Promise<string> {
   if (process.env.AUTH_SECRET && process.env.AUTH_SECRET.length >= 16) {
     return process.env.AUTH_SECRET;
   }
-  const row = db.prepare('SELECT value FROM site_settings WHERE key = ?').get('auth_secret') as { value: string } | undefined;
-  return row ? row.value : 'fallback-dev-secret-change-in-env';
+  await initDatabase();
+  if (cachedAuthSecret) {
+    return cachedAuthSecret;
+  }
+  const row = await queryOne<{ value: string }>(
+    'SELECT value FROM site_settings WHERE key = $1',
+    ['auth_secret']
+  );
+  cachedAuthSecret = row?.value || 'fallback-dev-secret-change-in-env';
+  return cachedAuthSecret;
 }
 
-export function getSiteSettings(): SiteSettings {
-  const rows = db.prepare('SELECT key, value FROM site_settings').all() as Array<{ key: string; value: string }>;
+export async function getSiteSettings(): Promise<SiteSettings> {
+  await initDatabase();
+  const rows = await queryAll<{ key: string; value: string }>(
+    'SELECT key, value FROM site_settings'
+  );
   const map: Record<string, string> = {};
   for (const r of rows) {
     map[r.key] = r.value;
@@ -243,8 +448,26 @@ export function getSiteSettings(): SiteSettings {
   };
 }
 
-export function getAllPlans(): SubscriptionPlan[] {
-  const rows = db.prepare('SELECT * FROM plans ORDER BY sort_order ASC').all() as Array<{
+export async function updateSiteSettings(
+  entries: Array<[string, string]>,
+  syncCurrencyToPlans?: string
+): Promise<void> {
+  await initDatabase();
+  for (const [k, v] of entries) {
+    await execute(
+      `INSERT INTO site_settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [k, v]
+    );
+  }
+  if (syncCurrencyToPlans) {
+    await execute('UPDATE plans SET currency = $1', [syncCurrencyToPlans]);
+  }
+}
+
+export async function getAllPlans(): Promise<SubscriptionPlan[]> {
+  await initDatabase();
+  const rows = await queryAll<{
     id: string;
     name_ar: string;
     name_en: string;
@@ -258,7 +481,7 @@ export function getAllPlans(): SubscriptionPlan[] {
     is_popular: number;
     is_active: number;
     sort_order: number;
-  }>;
+  }>('SELECT * FROM plans ORDER BY sort_order ASC');
 
   return rows.map((r) => ({
     id: r.id,
@@ -266,15 +489,61 @@ export function getAllPlans(): SubscriptionPlan[] {
     nameEn: r.name_en,
     descriptionAr: r.description_ar,
     descriptionEn: r.description_en,
-    price: r.price,
+    price: Number(r.price),
     currency: r.currency,
-    durationDays: r.duration_days,
+    durationDays: Number(r.duration_days),
     featuresAr: safeParseArray(r.features_ar),
     featuresEn: safeParseArray(r.features_en),
     isPopular: Boolean(r.is_popular),
     isActive: Boolean(r.is_active),
-    sortOrder: r.sort_order,
+    sortOrder: Number(r.sort_order),
   }));
+}
+
+export async function getPlanById(
+  id: string
+): Promise<{ id: string; duration_days: number } | null> {
+  await initDatabase();
+  return queryOne<{ id: string; duration_days: number }>(
+    'SELECT id, duration_days FROM plans WHERE id = $1',
+    [id]
+  );
+}
+
+export async function updatePlan(
+  planId: string,
+  data: {
+    nameAr: string;
+    nameEn: string;
+    descriptionAr: string;
+    descriptionEn: string;
+    price: number;
+    currency: string;
+    durationDays: number;
+    isPopular: number;
+    isActive: number;
+  }
+): Promise<boolean> {
+  await initDatabase();
+  const res = await execute(
+    `UPDATE plans
+     SET name_ar = $1, name_en = $2, description_ar = $3, description_en = $4,
+         price = $5, currency = $6, duration_days = $7, is_popular = $8, is_active = $9
+     WHERE id = $10`,
+    [
+      data.nameAr,
+      data.nameEn,
+      data.descriptionAr,
+      data.descriptionEn,
+      data.price,
+      data.currency,
+      data.durationDays,
+      data.isPopular,
+      data.isActive,
+      planId,
+    ]
+  );
+  return res.rowCount > 0;
 }
 
 function safeParseArray(json: string): string[] {
@@ -311,27 +580,195 @@ export function sanitizeUser(row: DbUserRow): UserProfile {
     status: row.status,
     subscriptionStart: row.subscription_start,
     subscriptionEnd: row.subscription_end,
-    generationCount: row.generation_count,
+    generationCount: Number(row.generation_count),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-export function refreshUserExpiration(row: DbUserRow): DbUserRow {
+export async function getUserById(id: string): Promise<DbUserRow | null> {
+  await initDatabase();
+  return queryOne<DbUserRow>('SELECT * FROM users WHERE id = $1', [id]);
+}
+
+export async function getUserByPhone(phone: string): Promise<DbUserRow | null> {
+  await initDatabase();
+  return queryOne<DbUserRow>('SELECT * FROM users WHERE phone = $1', [phone]);
+}
+
+export async function createUser(params: {
+  id: string;
+  name: string;
+  phone: string;
+  passwordHash: string;
+  planId: string;
+  now: string;
+}): Promise<DbUserRow> {
+  await initDatabase();
+  await execute(
+    `INSERT INTO users (
+      id, name, phone, password_hash, selected_plan_id, status,
+      subscription_start, subscription_end, generation_count, daily_count, daily_date, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, 'pending', NULL, NULL, 0, 0, NULL, $6, $7)`,
+    [
+      params.id,
+      params.name,
+      params.phone,
+      params.passwordHash,
+      params.planId,
+      params.now,
+      params.now,
+    ]
+  );
+  const created = await getUserById(params.id);
+  if (!created) {
+    throw new Error('Failed to retrieve newly created user.');
+  }
+  return created;
+}
+
+export async function requestUserRenewal(
+  userId: string,
+  planId: string,
+  now: string
+): Promise<DbUserRow | null> {
+  await initDatabase();
+  await execute(
+    'UPDATE users SET selected_plan_id = $1, status = $2, updated_at = $3 WHERE id = $4',
+    [planId, 'pending', now, userId]
+  );
+  return getUserById(userId);
+}
+
+export async function incrementUserGeneration(
+  userId: string,
+  nextDaily: number,
+  todayStr: string,
+  nowIso: string
+): Promise<void> {
+  await initDatabase();
+  await execute(
+    'UPDATE users SET generation_count = generation_count + 1, daily_count = $1, daily_date = $2, updated_at = $3 WHERE id = $4',
+    [nextDaily, todayStr, nowIso, userId]
+  );
+  await execute("UPDATE stats SET value = value + 1 WHERE key = 'total_generations'");
+}
+
+export async function listAllUsers(): Promise<DbUserRow[]> {
+  await initDatabase();
+  return queryAll<DbUserRow>('SELECT * FROM users ORDER BY created_at DESC');
+}
+
+export async function adminUpdateUserSubscription(
+  userId: string,
+  data: {
+    planId: string;
+    status: SubscriptionStatus;
+    subscriptionStart: string | null;
+    subscriptionEnd: string | null;
+    updatedAt: string;
+  }
+): Promise<DbUserRow | null> {
+  await initDatabase();
+  await execute(
+    `UPDATE users
+     SET selected_plan_id = $1, status = $2, subscription_start = $3, subscription_end = $4, updated_at = $5
+     WHERE id = $6`,
+    [
+      data.planId,
+      data.status,
+      data.subscriptionStart,
+      data.subscriptionEnd,
+      data.updatedAt,
+      userId,
+    ]
+  );
+  return getUserById(userId);
+}
+
+export async function deleteUserById(userId: string): Promise<boolean> {
+  await initDatabase();
+  const res = await execute('DELETE FROM users WHERE id = $1', [userId]);
+  return res.rowCount > 0;
+}
+
+export async function getAdminByUsername(
+  username: string
+): Promise<{ id: string; username: string; password_hash: string } | null> {
+  await initDatabase();
+  return queryOne<{ id: string; username: string; password_hash: string }>(
+    'SELECT id, username, password_hash FROM admins WHERE username = $1',
+    [username]
+  );
+}
+
+export async function getAdminById(
+  id: string
+): Promise<{ id: string; username: string } | null> {
+  await initDatabase();
+  return queryOne<{ id: string; username: string }>(
+    'SELECT id, username FROM admins WHERE id = $1',
+    [id]
+  );
+}
+
+export async function getTotalGenerations(): Promise<number> {
+  await initDatabase();
+  const row = await queryOne<{ value: number }>(
+    "SELECT value FROM stats WHERE key = 'total_generations'"
+  );
+  return Number(row?.value ?? 0);
+}
+
+export async function getVoiceSampleCache(
+  cacheKey: string
+): Promise<{ audio_base64: string; duration_seconds: number } | null> {
+  await initDatabase();
+  return queryOne<{ audio_base64: string; duration_seconds: number }>(
+    'SELECT audio_base64, duration_seconds FROM voice_samples_cache WHERE cache_key = $1',
+    [cacheKey]
+  );
+}
+
+export async function saveVoiceSampleCache(
+  cacheKey: string,
+  audioBase64: string,
+  durationSeconds: number,
+  createdAt: string
+): Promise<void> {
+  await initDatabase();
+  await execute(
+    `INSERT INTO voice_samples_cache (cache_key, audio_base64, duration_seconds, created_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (cache_key) DO UPDATE SET
+       audio_base64 = EXCLUDED.audio_base64,
+       duration_seconds = EXCLUDED.duration_seconds,
+       created_at = EXCLUDED.created_at`,
+    [cacheKey, audioBase64, durationSeconds, createdAt]
+  );
+}
+
+export async function refreshUserExpiration(row: DbUserRow): Promise<DbUserRow> {
   if (row.status === 'active' && row.subscription_end) {
     const endMs = new Date(row.subscription_end).getTime();
     if (!Number.isNaN(endMs) && endMs <= Date.now()) {
       const nowIso = new Date().toISOString();
-      db.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?').run('expired', nowIso, row.id);
+      await execute('UPDATE users SET status = $1, updated_at = $2 WHERE id = $3', [
+        'expired',
+        nowIso,
+        row.id,
+      ]);
       return { ...row, status: 'expired', updated_at: nowIso };
     }
   }
   return row;
 }
 
-export function expireAllOverdueSubscriptions(): void {
+export async function expireAllOverdueSubscriptions(): Promise<void> {
+  await initDatabase();
   const nowIso = new Date().toISOString();
-  db.prepare(
-    "UPDATE users SET status = 'expired', updated_at = ? WHERE status = 'active' AND subscription_end IS NOT NULL AND subscription_end <= ?"
-  ).run(nowIso, nowIso);
+  await execute(
+    "UPDATE users SET status = 'expired', updated_at = $1 WHERE status = 'active' AND subscription_end IS NOT NULL AND subscription_end <= $2",
+    [nowIso, nowIso]
+  );
 }

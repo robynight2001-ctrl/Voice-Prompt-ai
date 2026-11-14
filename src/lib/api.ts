@@ -47,8 +47,8 @@ async function request<T>(url: string, options: RequestInit = {}, token?: string
         typeof document !== 'undefined' && document.documentElement.lang === 'ar';
       throw new Error(
         isAr
-          ? 'خادم الواجهة البرمجية غير نشط على هذا الرابط (404). تأكد من تشغيل التطبيق كخادم متكامل (node server.ts) وليس كاستضافة ملفات ثابتة فقط.'
-          : 'API server route not found (404). Make sure the full-stack server (node server.ts) is running and not static-only hosting.'
+          ? 'خادم الواجهة البرمجية غير متاح على هذا المسار (404). تأكد من نشر دوال الخادم (/api/index.ts و vercel.json) أو تشغيل الخادم الكامل (node server.ts).'
+          : 'API server route not found (404). Ensure Vercel serverless functions (/api/index.ts + vercel.json) are deployed or run the full-stack server (node server.ts).'
       );
     }
     throw new Error(data.error || `Request failed (${res.status})`);
