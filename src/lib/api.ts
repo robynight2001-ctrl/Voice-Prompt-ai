@@ -43,8 +43,12 @@ async function request<T>(url: string, options: RequestInit = {}, token?: string
     : {};
   if (!res.ok) {
     if (res.status === 404 && !data.error) {
+      const isAr =
+        typeof document !== 'undefined' && document.documentElement.lang === 'ar';
       throw new Error(
-        'API server route not found (404). Make sure the full-stack server (node server.ts) is running and not static-only hosting.'
+        isAr
+          ? 'خادم الواجهة البرمجية غير نشط على هذا الرابط (404). تأكد من تشغيل التطبيق كخادم متكامل (node server.ts) وليس كاستضافة ملفات ثابتة فقط.'
+          : 'API server route not found (404). Make sure the full-stack server (node server.ts) is running and not static-only hosting.'
       );
     }
     throw new Error(data.error || `Request failed (${res.status})`);
